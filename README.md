@@ -65,4 +65,80 @@ Discordのチャット入力欄で `/interval` と入力すると、追いかけ
 * **例:** `/interval minutes:30` （未完了時の通知を30分間隔に変更します）
 
 ※ *注意事項: コマンドで変更した設定はメモリ上に保存されるため、Botのプログラムを再起動するとデフォルトの設定（60分）にリセットされます。*
+
+
+### 🚀 Botをサービス化する手順
+
+#### ステップ1：サービス設定ファイルを作成する
+まず、OSに「こういうBotを動かしてね」と指示する設定ファイルを作ります。
+ターミナルで以下のコマンドを実行し、テキストエディタ（nano）を開きます。
+
+```bash
+sudo nano /etc/systemd/system/medicine_bot.service
 ```
+*(※パスワードを聞かれたら、paladminユーザーのパスワードを入力してください)*
+
+#### ステップ2：設定を書き込む
+開いた真っ黒な画面に、以下の内容をそのままコピー＆ペーストしてください。
+
+```ini
+[Unit]
+Description=Medicine Reminder Discord Bot
+After=network.target
+
+[Service]
+# 実行するユーザー名と、Botのファイルがあるディレクトリ
+User=paladmin
+WorkingDirectory=/home/paladmin/bot
+
+# 実行するコマンド（python3の絶対パスとファイルの絶対パス）
+ExecStart=/usr/bin/python3 /home/paladmin/bot/medicene_bot.py
+
+# エラーで落ちた場合、常に自動再起動する設定
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+貼り付けたら、以下のキーボード操作で保存して閉じます。
+1. `Ctrl + O` （アルファベットのオー）を押して保存
+2. `Enter` を押して確定
+3. `Ctrl + X` を押して閉じる
+
+#### ステップ3：OSに設定を読み込ませて起動する
+ファイルを作ったら、以下のコマンドを上から順に1行ずつ実行してください。
+
+```bash
+# 1. 今作った新しい設定ファイルをOSに認識させる
+sudo systemctl daemon-reload
+
+# 2. Botを起動する
+sudo systemctl start medicine_bot.service
+
+# 3. サーバー起動時に、自動でBotも起動するように設定する
+sudo systemctl enable medicine_bot.service
+```
+
+#### ステップ4：ちゃんと動いているか確認する
+最後に、以下のコマンドでBotの状態を確認します。
+
+```bash
+sudo systemctl status medicine_bot.service
+```
+
+緑色で **`active (running)`** と表示されていれば、大成功です！
+（確認画面から抜けるには `q` キーを押してください）
+
+---
+
+### 💡 今後の管理コマンド
+
+サービス化した後は、これらのコマンドで簡単にBotを操作できるようになります。プログラムを書き換えた後は `restart` をするだけでOKです。
+
+* **Botを止める:** `sudo systemctl stop medicine_bot.service`
+* **Botを再起動する:** `sudo systemctl restart medicine_bot.service`
+* **ログを見る:** `journalctl -u medicine_bot.service -e`
+
+最初は少し難しく感じるかもしれませんが、一度設定してしまうと放置でずっと動き続けてくれるので、非常に快適になりますよ！ぜひ試してみてください。
