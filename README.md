@@ -1,0 +1,2 @@
+# Medicine_Remind_DiscordBot
+薬を飲む時間に通知をしてくれるDIscordBotのコード
