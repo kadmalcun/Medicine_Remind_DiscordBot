@@ -24,6 +24,7 @@ class MedicineBot(commands.Bot):
         self.is_snoozed = False  # スヌーズ中かどうか
         self.retry_interval = 60  # デフォルトの追いかけ通知間隔（分）
         self._snooze_task = None  # スヌーズ用のタスク
+        self.active_views: list = []  # アクティブな MedicineView を追跡
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -39,6 +40,7 @@ class MedicineBot(commands.Bot):
             self.is_skipped = False
             self.is_snoozed = False
             self._cancel_snooze()
+            self.active_views.clear()
             await self.send_reminder("💊 **お薬の時間です！**\n飲んだら「完了」、飲まない場合は「今日は飲まない」を押してください。")
             return
 
@@ -54,7 +56,9 @@ class MedicineBot(commands.Bot):
         channel = self.get_channel(CHANNEL_ID)
         if channel:
             view = MedicineView(self)
-            await channel.send(f"@everyone {text}", view=view)
+            message = await channel.send(f"@everyone {text}", view=view)
+            view.message = message
+            self.active_views.append(view)
 
     async def _snooze_reminder(self, snooze_hours):
         """スヌーズ時間が経過した後に再通知を送信する"""
@@ -123,6 +127,7 @@ class MedicineView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
         self.bot = bot
+        self.message = None  # send_reminder で設定される
 
     @discord.ui.button(label="完了！ ✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -132,14 +137,14 @@ class MedicineView(discord.ui.View):
             return
         self.bot.is_taken = True
         self.bot._cancel_snooze()
-        # 第2引数のephemeralをFalseにして全体通知
         await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を停止します ✨", False)
-        # 取り消しボタンを送信
+        await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="taken")
-        await interaction.channel.send(
+        undo_msg = await interaction.channel.send(
             "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
             view=undo_view
         )
+        undo_view.message = undo_msg
 
     @discord.ui.button(label="今日は飲まない ⏭️", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -148,14 +153,14 @@ class MedicineView(discord.ui.View):
             return
         self.bot.is_skipped = True
         self.bot._cancel_snooze()
-        # 第2引数のephemeralをFalseにして全体通知
         await self.disable_all_buttons(interaction, f"⏭️ {interaction.user.display_name} が今日の分をスキップしました。通知を停止します 💤", False)
-        # 取り消しボタンを送信
+        await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="skipped")
-        await interaction.channel.send(
+        undo_msg = await interaction.channel.send(
             "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
             view=undo_view
         )
+        undo_view.message = undo_msg
 
     @discord.ui.button(label="後で通知 🔔", style=discord.ButtonStyle.primary)
     async def snooze(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -181,8 +186,20 @@ class MedicineView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
-        # 全体に見える通知を送信
         await interaction.followup.send(message, ephemeral=is_ephemeral)
+
+    async def _disable_other_active_views(self):
+        """このビュー以外のアクティブな MedicineView のボタンを無効化する"""
+        for view in self.bot.active_views:
+            if view is not self:
+                for item in view.children:
+                    item.disabled = True
+                if view.message:
+                    try:
+                        await view.message.edit(view=view)
+                    except (discord.NotFound, discord.HTTPException):
+                        pass
+        self.bot.active_views.clear()
 
 class SnoozeSelectView(discord.ui.View):
     """スヌーズ時間を選択するドロップダウンメニュー"""
@@ -235,6 +252,7 @@ class UndoActionView(discord.ui.View):
         super().__init__(timeout=60)  # 60秒で期限切れ
         self.bot = bot
         self.action_type = action_type  # "taken" or "skipped"
+        self.message = None  # confirm/skip ハンドラで設定される
 
     @discord.ui.button(label="取り消す ↩️", style=discord.ButtonStyle.danger)
     async def undo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -254,9 +272,16 @@ class UndoActionView(discord.ui.View):
         await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。")
 
     async def on_timeout(self):
-        """タイムアウト時にボタンを無効化する"""
+        """60秒経過でボタンを無効化してメッセージを更新する"""
         for item in self.children:
             item.disabled = True
-        # タイムアウト時はメッセージを編集できないため、何もしない
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="↩️ 取り消し期限が切れました（60秒経過）",
+                    view=self
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
 bot.run(TOKEN)
