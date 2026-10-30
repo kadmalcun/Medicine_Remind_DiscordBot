@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# 本番デプロイスクリプト（palserver 上で root として実行される）
+#
+# ★重要: このファイルは「原本」。実際に実行されるのは /usr/local/sbin/medicine-bot-deploy
+#   に設置した root 所有のコピーのほう。リポジトリ内のスクリプトをそのまま sudo 実行する
+#   構成にすると、push できる者が誰でも root で任意コードを実行できてしまう。
+#   このファイルを変更したら、サーバー側への再設置（deploy/setup-server.sh）も必ず行うこと。
+#
+# 引数は取らない。sudoers はこのコマンドを引数の制限なしで許可しているため、
+# 配布元などを引数で指定できるようにすると任意のディレクトリから配置できてしまう。
+set -euo pipefail
+
+# セルフホストランナーのチェックアウト先（固定）。
+# <ランナーのルート>/_work/<リポジトリ名>/<リポジトリ名> という構成
+SRC=/home/gh-runner/medicine-runner/_work/Medicine_Remind_DiscordBot/Medicine_Remind_DiscordBot
+DEST=/home/paladmin/bot/medicine_notice_bot
+OWNER=paladmin
+SERVICE=medicine_bot.service
+
+# 配置前の状態を退避する場所と、残す世代数
+BACKUP_ROOT=/var/backups/medicine-bot
+KEEP=5
+
+# 配るファイルは許可リストにする。.env と venv はサーバー側のものを使うので触らない
+ITEMS=(medicine_bot.py requirements.txt)
+
+log()  { printf '  %s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "root で実行すること（sudo /usr/local/sbin/medicine-bot-deploy）"
+[[ $# -eq 0 ]]    || die "引数は取らない"
+[[ -d $SRC ]]     || die "配布元が見つからない: $SRC"
+[[ -f $SRC/medicine_bot.py ]] || die "$SRC はこのリポジトリのチェックアウトに見えない"
+[[ -x $DEST/venv/bin/python3 ]] || die "venv が見つからない: $DEST/venv"
+
+step "配布元"
+log "$SRC"
+# チェックアウトは gh-runner 所有なので、root から読むには safe.directory の指定が要る
+log "commit: $(git -c safe.directory="$SRC" -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# ----------------------------------------------------------------------------
+step "配置前の状態を退避 → $BACKUP_ROOT"
+bk=$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)
+install -d -o root -g root -m 700 "$BACKUP_ROOT"
+mkdir -m 700 "$bk"
+for item in "${ITEMS[@]}"; do
+  if [[ -e $DEST/$item ]]; then cp -p "$DEST/$item" "$bk/"; fi
+done
+log "退避: $bk"
+# 古い世代を消す。名前が日時なので辞書順＝時刻順
+find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-[0-9]*' -printf '%f\n' \
+  | sort | head -n -"$KEEP" \
+  | while read -r old; do rm -rf -- "${BACKUP_ROOT:?}/$old"; log "古い世代を削除: $old"; done
+
+# requirements.txt が変わったときだけ pip を回す
+req_changed=0
+if ! cmp -s "$SRC/requirements.txt" "$DEST/requirements.txt"; then req_changed=1; fi
+
+install_requirements() {
+  sudo -u "$OWNER" "$DEST/venv/bin/pip" install --quiet -r "$DEST/requirements.txt"
+}
+
+# 再起動して、15秒後も同じプロセスのまま動いているかを確かめる。
+# Restart=always なので、起動直後に落ちても is-active だけでは見逃すことがある。
+# InvocationID が変わっていれば、その間に落ちて再起動されたということ
+restart_and_check() {
+  systemctl restart "$SERVICE"
+  local id
+  id=$(systemctl show -p InvocationID --value "$SERVICE")
+  sleep 15
+  systemctl is-active --quiet "$SERVICE" \
+    && [[ $(systemctl show -p InvocationID --value "$SERVICE") == "$id" ]]
+}
+
+# ----------------------------------------------------------------------------
+step "配置 → $DEST"
+for item in "${ITEMS[@]}"; do
+  install -o "$OWNER" -g "$OWNER" -m 644 "$SRC/$item" "$DEST/$item"
+  log "配置: $item"
+done
+
+if [[ $req_changed -eq 1 ]]; then
+  step "依存パッケージをインストール"
+  install_requirements
+  log "OK"
+fi
+
+# ----------------------------------------------------------------------------
+step "$SERVICE を再起動"
+if restart_and_check; then
+  log "起動を確認"
+  printf '\nデプロイ完了\n'
+  exit 0
+fi
+
+printf '\n起動に失敗した。直近のログ:\n' >&2
+journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+
+step "退避した状態に戻す"
+for item in "${ITEMS[@]}"; do
+  if [[ -e $bk/$item ]]; then cp -p "$bk/$item" "$DEST/$item"; log "復元: $item"; fi
+done
+if [[ $req_changed -eq 1 ]]; then install_requirements; fi
+if restart_and_check; then
+  log "元の状態で起動を確認"
+else
+  log "警告: 元の状態でも起動しない。手動で確認すること"
+fi
+die "デプロイに失敗した（元の状態に戻した）"

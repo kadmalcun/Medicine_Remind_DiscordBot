@@ -1,0 +1,53 @@
+# 本番デプロイ
+#
+# トリガは main への push（＝PRのマージ）と手動実行のみ。**pull_request は入れない**。
+# pull_request イベントで実行されるワークフローはフォーク側のものなので、
+# それをセルフホストランナーに向けられると、他人のコードが自宅サーバーで実行されてしまう。
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    # Bot の動作に影響しない変更ではデプロイしない
+    paths-ignore:
+      - "README.md"
+      - ".env.example"
+  workflow_dispatch:
+
+# デプロイの多重実行を防ぐ。実行中のものは打ち切らず順番に流す
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # palserver の venv と同じバージョンにそろえる
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - run: pip install --quiet -r requirements.txt
+      - run: python -m py_compile medicine_bot.py
+      - run: bash -n deploy/medicine-bot-deploy deploy/setup-server.sh
+
+  deploy:
+    needs: validate
+    runs-on: [self-hosted, medicine-bot]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      # 実行されるのはリポジトリ内の deploy/medicine-bot-deploy ではなく、サーバーに
+      # 設置した root 所有のコピー。sudoers はこの1コマンドだけを NOPASSWD で許可している。
+      # 配置・再起動・起動確認（失敗時は元に戻す）までをこの中で行う
+      - name: デプロイ
+        run: sudo /usr/local/sbin/medicine-bot-deploy

@@ -105,10 +105,10 @@ After=network.target
 [Service]
 # 実行するユーザー名と、Botのファイルがあるディレクトリ
 User=paladmin
-WorkingDirectory=/home/paladmin/bot
+WorkingDirectory=/home/paladmin/bot/medicine_notice_bot
 
-# 実行するコマンド（python3の絶対パスとファイルの絶対パス）
-ExecStart=/usr/bin/python3 /home/paladmin/bot/medicine_bot.py
+# 実行するコマンド（venv内のpython3の絶対パスとファイルの絶対パス）
+ExecStart=/home/paladmin/bot/medicine_notice_bot/venv/bin/python3 /home/paladmin/bot/medicine_notice_bot/medicine_bot.py
 
 # エラーで落ちた場合、常に自動再起動する設定
 Restart=always
@@ -158,3 +158,29 @@ sudo systemctl status medicine_bot.service
 * **ログを見る:** `journalctl -u medicine_bot.service -e`
 
 最初は少し難しく感じるかもしれませんが、一度設定してしまうと放置でずっと動き続けてくれるので、非常に快適になりますよ！ぜひ試してみてください。
+
+---
+
+### 🤖 GitHub Actions による自動デプロイ
+
+`main` ブランチに push する（PRをマージする）と、`.github/workflows/deploy.yml` が次の順で実行されます。Actions 画面の「Run workflow」から手動でも実行できます。README だけの変更ではデプロイしません。
+
+1. **validate**（GitHub のランナー）: 依存パッケージのインストールと構文チェック
+2. **deploy**（palserver のセルフホストランナー、ラベル `medicine-bot`）: `sudo /usr/local/sbin/medicine-bot-deploy` を実行
+   * `medicine_bot.py` と `requirements.txt` を `/home/paladmin/bot/medicine_notice_bot` に配置（`.env` と `venv` はサーバー側のものを使います）
+   * `requirements.txt` が変わったときだけ `venv` に依存パッケージをインストール
+   * `medicine_bot.service` を再起動し、15秒後も落ちずに動いているかを確認
+   * 起動に失敗したら、配置前の状態（`/var/backups/medicine-bot` に5世代まで退避）に戻してジョブを失敗にします
+
+#### セキュリティ上の構成
+* ランナーは専用ユーザー `gh-runner` で動きます（`paladmin` の権限は持ちません）。
+* `gh-runner` が sudo できるのは `/usr/local/sbin/medicine-bot-deploy` だけです。これはリポジトリ内の `deploy/medicine-bot-deploy` を root 所有でコピーしたもので、リポジトリ側のスクリプトを直接 root で実行することはありません。**`deploy/medicine-bot-deploy` を変更したら、サーバーへの再設置が必要です**（下の手順を `RUNNER_TOKEN` なしで再実行）。
+* ワークフローは `pull_request` では動かしません。また、フォークからのPRのワークフローは「Require approval for all external contributors」に設定しています。
+
+#### 初回セットアップ（サーバー側）
+1. GitHub の **Settings > Actions > Runners > New self-hosted runner** に表示される登録トークンを控えます（`gh api -X POST repos/kadmalcun/Medicine_Remind_DiscordBot/actions/runners/registration-token --jq .token` でも取得できます。有効期限は1時間）。
+2. palserver にこのリポジトリを取得し、root で初期設定スクリプトを実行します。デプロイスクリプトの設置、sudoers の設定、ランナーの登録とサービス化までを行います。
+   ```bash
+   sudo RUNNER_TOKEN=<登録トークン> bash deploy/setup-server.sh
+   ```
+3. Runners の画面で `palserver-medicine` が「Idle」になれば準備完了です。
