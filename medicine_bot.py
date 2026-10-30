@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import datetime
 import asyncio
+import json
 import os
 from dotenv import load_dotenv
 
@@ -12,6 +13,44 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 REMIND_TIME = os.getenv("REMIND_TIME", "13:00")
+DEFAULT_RETRY_INTERVAL = 60  # デフォルトの追いかけ通知間隔（分）
+
+# 実行時のデータ（設定・服薬ログ）の保存先。個人情報を含むためgit管理外
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+LOG_PATH = os.path.join(DATA_DIR, "medicine_log.jsonl")
+
+def normalize_time(text):
+    """HH:MM 形式の文字列をゼロ埋めした形に整える（不正なら ValueError）"""
+    return datetime.strptime(text.strip(), "%H:%M").strftime("%H:%M")
+
+def load_config():
+    """config.json を読み込む。無い・壊れている場合は .env の値を初期値として使う"""
+    config = {"remind_time": normalize_time(REMIND_TIME), "retry_interval": DEFAULT_RETRY_INTERVAL}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+        if "remind_time" in saved:
+            config["remind_time"] = normalize_time(saved["remind_time"])
+        if "retry_interval" in saved:
+            config["retry_interval"] = max(1, int(saved["retry_interval"]))
+    except FileNotFoundError:
+        pass
+    except (ValueError, TypeError, OSError) as e:
+        print(f"⚠️ {CONFIG_PATH} を読み込めませんでした。初期値を使用します: {e}")
+    return config
+
+def _write_json(path, data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)  # 書き込み途中で落ちても壊れないよう置き換え
+
+def _append_line(path, line):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 class MedicineBot(commands.Bot):
     def __init__(self):
@@ -22,11 +61,16 @@ class MedicineBot(commands.Bot):
         self.is_taken = False
         self.is_skipped = False
         self.is_snoozed = False  # スヌーズ中かどうか
-        self.retry_interval = 60  # デフォルトの追いかけ通知間隔（分）
+        config = load_config()
+        self.remind_time = config["remind_time"]  # リマインド時刻（HH:MM）
+        self.retry_interval = config["retry_interval"]  # 追いかけ通知間隔（分）
         self._snooze_task = None  # スヌーズ用のタスク
         self.active_views: list = []  # アクティブな MedicineView を追跡
 
     async def setup_hook(self):
+        # 初回起動時は .env の値で config.json を作成しておく
+        if not os.path.exists(CONFIG_PATH):
+            await self.save_config()
         await self.tree.sync()
         self.main_loop.start()
 
@@ -35,30 +79,54 @@ class MedicineBot(commands.Bot):
         now = datetime.now().strftime("%H:%M")
         now_dt = datetime.now()
 
-        if now == REMIND_TIME:
+        if now == self.remind_time:
             self.is_taken = False
             self.is_skipped = False
             self.is_snoozed = False
             self._cancel_snooze()
             self.active_views.clear()
-            await self.send_reminder("💊 **お薬の時間です！**\n飲んだら「完了」、飲まない場合は「今日は飲まない」を押してください。")
+            await self.send_reminder("💊 **お薬の時間です！**\n飲んだら「完了」、飲まない場合は「今日は飲まない」を押してください。", kind="scheduled")
             return
 
-        remind_h, remind_m = map(int, REMIND_TIME.split(":"))
+        remind_h, remind_m = map(int, self.remind_time.split(":"))
         # スヌーズ中は追いかけ通知をしない（スヌーズタスクが代わりに通知する）
         if not self.is_taken and not self.is_skipped and not self.is_snoozed:
             if (now_dt.hour > remind_h or (now_dt.hour == remind_h and now_dt.minute > remind_m)):
                 passed_min = (now_dt.hour - remind_h) * 60 + (now_dt.minute - remind_m)
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
-                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！（{self.retry_interval}分おきに通知中）")
+                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！（{self.retry_interval}分おきに通知中）", kind="retry")
 
-    async def send_reminder(self, text):
+    async def send_reminder(self, text, kind):
+        """kind: scheduled（定刻）/ retry（追いかけ）/ snooze（スヌーズ後）/ resume（取り消し後）"""
         channel = self.get_channel(CHANNEL_ID)
         if channel:
             view = MedicineView(self)
             message = await channel.send(f"@everyone {text}", view=view)
             view.message = message
             self.active_views.append(view)
+            await self.record_event("reminder_sent", detail={"kind": kind})
+
+    async def save_config(self):
+        """現在の設定を config.json に保存する"""
+        config = {"remind_time": self.remind_time, "retry_interval": self.retry_interval}
+        try:
+            await asyncio.to_thread(_write_json, CONFIG_PATH, config)
+        except OSError as e:
+            print(f"⚠️ 設定を保存できませんでした: {e}")
+
+    async def record_event(self, event_type, user=None, detail=None):
+        """服薬イベントを medicine_log.jsonl に1行追記する"""
+        entry = {
+            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "event": event_type,
+            "user_id": user.id if user else None,
+            "user_name": user.display_name if user else None,
+            "detail": detail or {},
+        }
+        try:
+            await asyncio.to_thread(_append_line, LOG_PATH, json.dumps(entry, ensure_ascii=False))
+        except OSError as e:
+            print(f"⚠️ ログを記録できませんでした: {e}")
 
     async def _snooze_reminder(self, snooze_hours):
         """スヌーズ時間が経過した後に再通知を送信する"""
@@ -70,7 +138,8 @@ class MedicineBot(commands.Bot):
                 display = format_hours(snooze_hours)
                 await self.send_reminder(
                     f"🔔 **再通知（{display}後）**\n"
-                    f"お薬の時間を先送りしていました。飲んだら「完了」を押してください。"
+                    f"お薬の時間を先送りしていました。飲んだら「完了」を押してください。",
+                    kind="snooze"
                 )
         except asyncio.CancelledError:
             pass
@@ -103,8 +172,22 @@ async def set_interval(interaction: discord.Interaction, minutes: int):
         return
     
     bot.retry_interval = minutes
+    await bot.save_config()
     # 設定完了は全体に見えるように通知
     await interaction.response.send_message(f"✅ 追いかけ通知の間隔を **{minutes}分** に設定しました。", ephemeral=False)
+
+@bot.tree.command(name="remind_time", description="毎日のリマインド時刻を設定します")
+@app_commands.describe(time="リマインドする時刻をHH:MM形式で入力してください（例: 13:00）")
+async def set_remind_time(interaction: discord.Interaction, time: str):
+    try:
+        new_time = normalize_time(time)
+    except ValueError:
+        await interaction.response.send_message("HH:MM形式（例: 13:00）で入力してください。", ephemeral=True)
+        return
+
+    bot.remind_time = new_time
+    await bot.save_config()
+    await interaction.response.send_message(f"✅ リマインド時刻を **{new_time}** に設定しました。", ephemeral=False)
 
 @bot.tree.command(name="snooze", description="指定した時間後に再通知します（即時スヌーズ）")
 @app_commands.describe(hours="再通知するまでの時間を入力してください（例: 2）")
@@ -117,6 +200,7 @@ async def set_snooze(interaction: discord.Interaction, hours: float):
     bot.is_snoozed = True
     bot._cancel_snooze()
     bot._snooze_task = asyncio.create_task(bot._snooze_reminder(hours))
+    await bot.record_event("snoozed", user=interaction.user, detail={"hours": hours})
 
     await interaction.response.send_message(
         f"🔔 {interaction.user.display_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤",
@@ -137,6 +221,7 @@ class MedicineView(discord.ui.View):
             return
         self.bot.is_taken = True
         self.bot._cancel_snooze()
+        await self.bot.record_event("taken", user=interaction.user)
         await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を停止します ✨", False)
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="taken")
@@ -153,6 +238,7 @@ class MedicineView(discord.ui.View):
             return
         self.bot.is_skipped = True
         self.bot._cancel_snooze()
+        await self.bot.record_event("skipped", user=interaction.user)
         await self.disable_all_buttons(interaction, f"⏭️ {interaction.user.display_name} が今日の分をスキップしました。通知を停止します 💤", False)
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="skipped")
@@ -229,6 +315,7 @@ class SnoozeSelectView(discord.ui.View):
         self.bot._cancel_snooze()
         # 選択された時間でスヌーズタスクを開始
         self.bot._snooze_task = asyncio.create_task(self.bot._snooze_reminder(snooze_hours))
+        await self.bot.record_event("snoozed", user=interaction.user, detail={"hours": snooze_hours})
 
         # 本人への確認（ephemeral）
         await interaction.response.edit_message(
@@ -262,6 +349,7 @@ class UndoActionView(discord.ui.View):
         else:
             self.bot.is_skipped = False
             label = "スキップ"
+        await self.bot.record_event(f"undo_{self.action_type}", user=interaction.user)
 
         button.disabled = True
         await interaction.response.edit_message(
@@ -269,7 +357,7 @@ class UndoActionView(discord.ui.View):
             view=self
         )
         # 即座にリマインドを再送信
-        await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。")
+        await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。", kind="resume")
 
     async def on_timeout(self):
         """60秒経過でボタンを無効化してメッセージを更新する"""
