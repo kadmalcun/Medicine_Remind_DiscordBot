@@ -1,0 +1,32 @@
+# テスト用 Bot へのデプロイ
+#
+# 手動実行のみ。Actions 画面（または gh workflow run deploy-staging.yml --ref <ブランチ>）で
+# ブランチを選ぶと、そのブランチを palserver のテスト用 Bot に入れる。
+# 本番と同じサーバー・同じ Python・同じデプロイスクリプトで、配置先と .env だけが違う。
+name: Deploy (staging)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
+  deploy:
+    needs: validate
+    runs-on: [self-hosted, medicine-bot]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      # 実行されるのはサーバーに設置した root 所有のコピー（本番用と同じ中身で、名前だけ違う）
+      - name: デプロイ
+        run: sudo /usr/local/sbin/medicine-bot-deploy-staging

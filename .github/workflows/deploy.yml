@@ -8,10 +8,11 @@ name: Deploy
 on:
   push:
     branches: [main]
-    # Bot の動作に影響しない変更ではデプロイしない
-    paths-ignore:
-      - "README.md"
-      - ".env.example"
+    # 本番に配るファイルが変わったときだけデプロイする（ワークフローやドキュメントだけの
+    # 変更で本番の Bot を再起動しない）。デプロイスクリプトが配るのはこの2つだけ
+    paths:
+      - "medicine_bot.py"
+      - "requirements.txt"
   workflow_dispatch:
 
 # デプロイの多重実行を防ぐ。実行中のものは打ち切らず順番に流す
@@ -24,23 +25,13 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # palserver の venv と同じバージョンにそろえる
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
-
-      - run: pip install --quiet -r requirements.txt
-      - run: python -m py_compile medicine_bot.py
-      - run: python -m unittest discover tests
-      - run: bash -n deploy/medicine-bot-deploy deploy/setup-server.sh
+    uses: ./.github/workflows/validate.yml
 
   deploy:
     needs: validate
+    # 手動実行で main 以外のブランチを選んでも、本番には入れない
+    # （ブランチを試すときは deploy-staging.yml を使う）
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, medicine-bot]
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +39,7 @@ jobs:
           clean: true
 
       # 実行されるのはリポジトリ内の deploy/medicine-bot-deploy ではなく、サーバーに
-      # 設置した root 所有のコピー。sudoers はこの1コマンドだけを NOPASSWD で許可している。
+      # 設置した root 所有のコピー。sudoers はこれとテスト用 Bot 用の2つだけを NOPASSWD で許可している。
       # 配置・再起動・起動確認（失敗時は元に戻す）までをこの中で行う
       - name: デプロイ
         run: sudo /usr/local/sbin/medicine-bot-deploy

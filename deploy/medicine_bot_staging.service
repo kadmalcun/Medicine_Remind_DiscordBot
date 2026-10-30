@@ -1,0 +1,15 @@
+# テスト用 Bot のサービス（deploy/setup-server.sh が /etc/systemd/system/ に設置する）
+# 本番の medicine_bot.service と同じ構成で、配置先・.env・data/ だけを分けている
+[Unit]
+Description=Medicine Reminder Discord Bot (staging)
+After=network.target
+
+[Service]
+User=paladmin
+WorkingDirectory=/home/paladmin/bot/medicine_notice_bot_staging
+ExecStart=/home/paladmin/bot/medicine_notice_bot_staging/venv/bin/python3 /home/paladmin/bot/medicine_notice_bot_staging/medicine_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

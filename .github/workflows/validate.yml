@@ -1,0 +1,25 @@
+# 構文チェックと単体テスト。deploy.yml と deploy-staging.yml から呼び出す
+name: Validate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # palserver の venv と同じバージョンにそろえる
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - run: pip install --quiet -r requirements.txt
+      - run: python -m py_compile medicine_bot.py
+      - run: python -m unittest discover tests
+      - run: bash -n deploy/medicine-bot-deploy deploy/setup-server.sh

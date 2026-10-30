@@ -1,25 +1,43 @@
 #!/usr/bin/env bash
 #
-# 本番デプロイスクリプト（palserver 上で root として実行される）
+# デプロイスクリプト（palserver 上で root として実行される）
 #
-# ★重要: このファイルは「原本」。実際に実行されるのは /usr/local/sbin/medicine-bot-deploy
-#   に設置した root 所有のコピーのほう。リポジトリ内のスクリプトをそのまま sudo 実行する
+# ★重要: このファイルは「原本」。実際に実行されるのは /usr/local/sbin/ に設置した
+#   root 所有のコピーのほう。リポジトリ内のスクリプトをそのまま sudo 実行する
 #   構成にすると、push できる者が誰でも root で任意コードを実行できてしまう。
 #   このファイルを変更したら、サーバー側への再設置（deploy/setup-server.sh）も必ず行うこと。
 #
+# 同じファイルを2つの名前で設置し、名前で配置先を切り替える。
+#   medicine-bot-deploy          → 本番
+#   medicine-bot-deploy-staging  → テスト用 Bot
+#
 # 引数は取らない。sudoers はこのコマンドを引数の制限なしで許可しているため、
-# 配布元などを引数で指定できるようにすると任意のディレクトリから配置できてしまう。
+# 配布元や配置先を引数で指定できるようにすると任意のディレクトリから配置できてしまう。
 set -euo pipefail
 
 # セルフホストランナーのチェックアウト先（固定）。
 # <ランナーのルート>/_work/<リポジトリ名>/<リポジトリ名> という構成
 SRC=/home/gh-runner/medicine-runner/_work/Medicine_Remind_DiscordBot/Medicine_Remind_DiscordBot
-DEST=/home/paladmin/bot/medicine_notice_bot
 OWNER=paladmin
-SERVICE=medicine_bot.service
 
-# 配置前の状態を退避する場所と、残す世代数
-BACKUP_ROOT=/var/backups/medicine-bot
+case $(basename "$0") in
+  medicine-bot-deploy)
+    DEST=/home/paladmin/bot/medicine_notice_bot
+    SERVICE=medicine_bot.service
+    BACKUP_ROOT=/var/backups/medicine-bot
+    ;;
+  medicine-bot-deploy-staging)
+    DEST=/home/paladmin/bot/medicine_notice_bot_staging
+    SERVICE=medicine_bot_staging.service
+    BACKUP_ROOT=/var/backups/medicine-bot-staging
+    ;;
+  *)
+    printf 'ERROR: 想定していない名前で実行された: %s\n' "$0" >&2
+    exit 1
+    ;;
+esac
+
+# 配置前の状態を退避する場所に残す世代数
 KEEP=5
 
 # 配るファイルは許可リストにする。.env と venv はサーバー側のものを使うので触らない
@@ -29,7 +47,7 @@ log()  { printf '  %s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "root で実行すること（sudo /usr/local/sbin/medicine-bot-deploy）"
+[[ $EUID -eq 0 ]] || die "root で実行すること（sudo $0）"
 [[ $# -eq 0 ]]    || die "引数は取らない"
 [[ -d $SRC ]]     || die "配布元が見つからない: $SRC"
 [[ -f $SRC/medicine_bot.py ]] || die "$SRC はこのリポジトリのチェックアウトに見えない"
