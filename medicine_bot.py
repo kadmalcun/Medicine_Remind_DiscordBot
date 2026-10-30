@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import os
 from dotenv import load_dotenv
@@ -11,20 +11,23 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-REMIND_TIME = os.getenv("REMIND_TIME", "13:00")
+_raw_time = os.getenv("REMIND_TIME", "13:00")
+_h, _m = map(int, _raw_time.split(":"))
+REMIND_TIME = f"{_h:02d}:{_m:02d}"
 
 class MedicineBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        
+
         self.is_taken = False
-        self.is_skipped = False
+        self.is_home_waiting = False  # 「家に帰って飲む」待ち状態
         self.is_snoozed = False  # スヌーズ中かどうか
         self.retry_interval = 60  # デフォルトの追いかけ通知間隔（分）
         self._snooze_task = None  # スヌーズ用のタスク
+        self._home_task = None  # 家帰って飲む用のタスク（22時再通知）
         self.active_views: list = []  # アクティブな MedicineView を追跡
+        self.missed_doses = 0  # 飲み忘れて翌日に持ち越す錠数
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -37,40 +40,96 @@ class MedicineBot(commands.Bot):
 
         if now == REMIND_TIME:
             self.is_taken = False
-            self.is_skipped = False
+            self.is_home_waiting = False
             self.is_snoozed = False
             self._cancel_snooze()
-            self.active_views.clear()
-            await self.send_reminder("💊 **お薬の時間です！**\n飲んだら「完了」、飲まない場合は「今日は飲まない」を押してください。")
+            self._cancel_home()
+            if self.missed_doses > 0:
+                total = self.missed_doses + 1
+                text = (
+                    "💊 **お薬の時間です！**\n"
+                    f"⚠️ 前日までの分を飲み忘れています。今日の分と合わせて **{total}錠** 飲んでください。\n"
+                    "飲んだら「完了」、後で飲む場合は「家に帰って飲む」を押してください。"
+                )
+            else:
+                text = "💊 **お薬の時間です！**\n飲んだら「完了」、後で飲む場合は「家に帰って飲む」を押してください。"
+            await self.send_reminder(text)
+            return
+
+        # 翌日3時を過ぎても飲んでいなければ持ち越す
+        if now == "03:00":
+            if not self.is_taken:
+                self.missed_doses += 1
+            self.is_home_waiting = False
+            self._cancel_home()
             return
 
         remind_h, remind_m = map(int, REMIND_TIME.split(":"))
-        # スヌーズ中は追いかけ通知をしない（スヌーズタスクが代わりに通知する）
-        if not self.is_taken and not self.is_skipped and not self.is_snoozed:
-            if (now_dt.hour > remind_h or (now_dt.hour == remind_h and now_dt.minute > remind_m)):
-                passed_min = (now_dt.hour - remind_h) * 60 + (now_dt.minute - remind_m)
+        total_now_min = now_dt.hour * 60 + now_dt.minute
+        total_remind_min = remind_h * 60 + remind_m
+
+        # REMIND_TIME以降か、0時〜3時未満（翌日へまたいだ通知継続）
+        in_notification_period = (total_now_min > total_remind_min) or (total_now_min < 3 * 60)
+
+        # スヌーズ中・家帰って待ち中は追いかけ通知をしない
+        if not self.is_taken and not self.is_home_waiting and not self.is_snoozed:
+            if in_notification_period:
+                passed_min = total_now_min - total_remind_min
+                if passed_min < 0:
+                    passed_min += 24 * 60  # 0時跨ぎ対応
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
                     await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！（{self.retry_interval}分おきに通知中）")
 
     async def send_reminder(self, text):
         channel = self.get_channel(CHANNEL_ID)
         if channel:
+            # 過去のリマインダーのボタンを消して、最新のものだけ有効にする
+            await self._disable_views(self.active_views)
+            self.active_views.clear()
             view = MedicineView(self)
             message = await channel.send(f"@everyone {text}", view=view)
             view.message = message
             self.active_views.append(view)
 
+    async def _disable_views(self, views):
+        """指定した View からボタンを削除してメッセージを更新する"""
+        for view in views:
+            view.clear_items()
+            if view.message:
+                try:
+                    await view.message.edit(view=view)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+
     async def _snooze_reminder(self, snooze_hours):
         """スヌーズ時間が経過した後に再通知を送信する"""
         try:
             await asyncio.sleep(snooze_hours * 3600)
-            # スヌーズ解除して再通知
             self.is_snoozed = False
-            if not self.is_taken and not self.is_skipped:
+            if not self.is_taken and not self.is_home_waiting:
                 display = format_hours(snooze_hours)
                 await self.send_reminder(
                     f"🔔 **再通知（{display}後）**\n"
                     f"お薬の時間を先送りしていました。飲んだら「完了」を押してください。"
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def _home_reminder(self):
+        """22時になったら再通知する"""
+        try:
+            now = datetime.now()
+            target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            await asyncio.sleep(wait_seconds)
+
+            self.is_home_waiting = False
+            if not self.is_taken:
+                await self.send_reminder(
+                    "🏠 **お帰りなさい！お薬の時間です！**\n"
+                    "飲んだら「完了」を押してください。"
                 )
         except asyncio.CancelledError:
             pass
@@ -80,6 +139,12 @@ class MedicineBot(commands.Bot):
         if self._snooze_task and not self._snooze_task.done():
             self._snooze_task.cancel()
             self._snooze_task = None
+
+    def _cancel_home(self):
+        """実行中のホーム待ちタスクをキャンセルする"""
+        if self._home_task and not self._home_task.done():
+            self._home_task.cancel()
+            self._home_task = None
 
 def format_hours(hours):
     """時間数を読みやすい文字列に変換する"""
@@ -98,12 +163,10 @@ bot = MedicineBot()
 @app_commands.describe(minutes="通知する間隔を分単位で入力してください（例: 15）")
 async def set_interval(interaction: discord.Interaction, minutes: int):
     if minutes < 1:
-        # エラーメッセージは本人にのみ表示
         await interaction.response.send_message("1分以上の間隔を設定してください。", ephemeral=True)
         return
-    
+
     bot.retry_interval = minutes
-    # 設定完了は全体に見えるように通知
     await interaction.response.send_message(f"✅ 追いかけ通知の間隔を **{minutes}分** に設定しました。", ephemeral=False)
 
 @bot.tree.command(name="snooze", description="指定した時間後に再通知します（即時スヌーズ）")
@@ -112,7 +175,7 @@ async def set_snooze(interaction: discord.Interaction, hours: float):
     if hours <= 0:
         await interaction.response.send_message("0より大きい値を設定してください。", ephemeral=True)
         return
-    
+
     display = format_hours(hours)
     bot.is_snoozed = True
     bot._cancel_snooze()
@@ -131,31 +194,39 @@ class MedicineView(discord.ui.View):
 
     @discord.ui.button(label="完了！ ✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 既に完了・スキップ済みならボタンを無効化して拒否
-        if self.bot.is_taken or self.bot.is_skipped:
+        if self.bot.is_taken or self.bot.is_home_waiting:
             await self._already_handled(interaction)
             return
         self.bot.is_taken = True
         self.bot._cancel_snooze()
+        self.bot._cancel_home()
+        prev_missed = self.bot.missed_doses
+        self.bot.missed_doses = 0
         await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を停止します ✨", False)
         await self._disable_other_active_views()
-        undo_view = UndoActionView(self.bot, action_type="taken")
+        undo_view = UndoActionView(self.bot, action_type="taken", restore_missed=prev_missed)
         undo_msg = await interaction.channel.send(
             "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
             view=undo_view
         )
         undo_view.message = undo_msg
 
-    @discord.ui.button(label="今日は飲まない ⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="家に帰って飲む 🏠", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.bot.is_taken or self.bot.is_skipped:
+        if self.bot.is_taken or self.bot.is_home_waiting:
             await self._already_handled(interaction)
             return
-        self.bot.is_skipped = True
+        self.bot.is_home_waiting = True
         self.bot._cancel_snooze()
-        await self.disable_all_buttons(interaction, f"⏭️ {interaction.user.display_name} が今日の分をスキップしました。通知を停止します 💤", False)
+        self.bot._cancel_home()
+        self.bot._home_task = asyncio.create_task(self.bot._home_reminder())
+        await self.disable_all_buttons(
+            interaction,
+            f"🏠 {interaction.user.display_name} が「家に帰って飲む」を設定しました。**22:00** に再通知します 💤",
+            False
+        )
         await self._disable_other_active_views()
-        undo_view = UndoActionView(self.bot, action_type="skipped")
+        undo_view = UndoActionView(self.bot, action_type="home")
         undo_msg = await interaction.channel.send(
             "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
             view=undo_view
@@ -164,10 +235,9 @@ class MedicineView(discord.ui.View):
 
     @discord.ui.button(label="後で通知 🔔", style=discord.ButtonStyle.primary)
     async def snooze(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.bot.is_taken or self.bot.is_skipped:
+        if self.bot.is_taken or self.bot.is_home_waiting:
             await self._already_handled(interaction)
             return
-        # 時間選択のドロップダウンを表示（本人のみに見える）
         view = SnoozeSelectView(self.bot, interaction.user.display_name)
         await interaction.response.send_message(
             "⏰ **何時間後に再通知しますか？**",
@@ -176,105 +246,109 @@ class MedicineView(discord.ui.View):
         )
 
     async def _already_handled(self, interaction):
-        """既に処理済みの場合、ボタンを無効化して通知する"""
-        for item in self.children:
-            item.disabled = True
+        self.clear_items()
         await interaction.response.edit_message(view=self)
         await interaction.followup.send("✋ 今日の服薬は既に記録済みです。", ephemeral=True)
 
     async def disable_all_buttons(self, interaction, message, is_ephemeral):
-        for item in self.children:
-            item.disabled = True
+        self.clear_items()
         await interaction.response.edit_message(view=self)
         await interaction.followup.send(message, ephemeral=is_ephemeral)
 
     async def _disable_other_active_views(self):
-        """このビュー以外のアクティブな MedicineView のボタンを無効化する"""
-        for view in self.bot.active_views:
-            if view is not self:
-                for item in view.children:
-                    item.disabled = True
-                if view.message:
-                    try:
-                        await view.message.edit(view=view)
-                    except (discord.NotFound, discord.HTTPException):
-                        pass
+        others = [v for v in self.bot.active_views if v is not self]
+        await self.bot._disable_views(others)
         self.bot.active_views.clear()
+
+class SnoozeSelect(discord.ui.Select):
+    """スヌーズ時間を選択するドロップダウン（実際の通知時刻を表示）"""
+    _OPTIONS = [
+        ("0.25", "⏰"),
+        ("0.5",  "⏰"),
+        ("1",    "🕐"),
+        ("2",    "🕑"),
+        ("3",    "🕒"),
+        ("4",    "🕓"),
+        ("6",    "🕕"),
+        ("7",    "🕖"),
+        ("8",    "🕗"),
+    ]
+
+    def __init__(self, bot, user_name):
+        self._bot = bot
+        self._user_name = user_name
+        now = datetime.now()
+        options = []
+        for value, emoji in self._OPTIONS:
+            hours = float(value)
+            notify_dt = now + timedelta(hours=hours)
+            time_str = notify_dt.strftime("%H:%M")
+            duration_str = format_hours(hours)
+            options.append(discord.SelectOption(
+                label=f"{time_str}（{duration_str}後）",
+                value=value,
+                emoji=emoji
+            ))
+        super().__init__(placeholder="再通知する時間を選んでください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        snooze_hours = float(self.values[0])
+        duration_str = format_hours(snooze_hours)
+        time_str = (datetime.now() + timedelta(hours=snooze_hours)).strftime("%H:%M")
+
+        self._bot.is_snoozed = True
+        self._bot._cancel_snooze()
+        self._bot._snooze_task = asyncio.create_task(self._bot._snooze_reminder(snooze_hours))
+
+        await interaction.response.edit_message(
+            content=f"✅ **{time_str}**（{duration_str}後）に再通知します。",
+            view=None
+        )
+        channel = self._bot.get_channel(CHANNEL_ID)
+        if channel:
+            await channel.send(
+                f"🔔 {self._user_name} が再通知を設定しました。**{time_str}**（{duration_str}後）にもう一度お知らせします 💤"
+            )
+
 
 class SnoozeSelectView(discord.ui.View):
     """スヌーズ時間を選択するドロップダウンメニュー"""
     def __init__(self, bot, user_name):
-        super().__init__(timeout=60)  # 60秒で選択期限切れ
-        self.bot = bot
-        self.user_name = user_name
-
-    @discord.ui.select(
-        placeholder="再通知する時間を選んでください",
-        options=[
-            discord.SelectOption(label="15分後",    value="0.25",  emoji="⏰"),
-            discord.SelectOption(label="30分後",    value="0.5",   emoji="⏰"),
-            discord.SelectOption(label="1時間後",   value="1",     emoji="🕐"),
-            discord.SelectOption(label="1時間半後", value="1.5",   emoji="🕜"),
-            discord.SelectOption(label="2時間後",   value="2",     emoji="🕑"),
-            discord.SelectOption(label="3時間後",   value="3",     emoji="🕒"),
-            discord.SelectOption(label="4時間後",   value="4",     emoji="🕓"),
-            discord.SelectOption(label="6時間後",   value="6",     emoji="🕕"),
-        ]
-    )
-    async def select_snooze_time(self, interaction: discord.Interaction, select: discord.ui.Select):
-        snooze_hours = float(select.values[0])
-        display = format_hours(snooze_hours)
-
-        self.bot.is_snoozed = True
-        self.bot._cancel_snooze()
-        # 選択された時間でスヌーズタスクを開始
-        self.bot._snooze_task = asyncio.create_task(self.bot._snooze_reminder(snooze_hours))
-
-        # 本人への確認（ephemeral）
-        await interaction.response.edit_message(
-            content=f"✅ **{display}後**に再通知します。",
-            view=None
-        )
-        # チャンネル全体への通知
-        channel = self.bot.get_channel(CHANNEL_ID)
-        if channel:
-            await channel.send(
-                f"🔔 {self.user_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤"
-            )
+        super().__init__(timeout=60)
+        self.add_item(SnoozeSelect(bot, user_name))
 
     async def on_timeout(self):
-        """タイムアウト時は何もしない（追いかけ通知が継続する）"""
         pass
 
 class UndoActionView(discord.ui.View):
-    """完了・スキップの取り消しボタン"""
-    def __init__(self, bot, action_type):
+    """完了・家帰って飲む設定の取り消しボタン"""
+    def __init__(self, bot, action_type, restore_missed=0):
         super().__init__(timeout=60)  # 60秒で期限切れ
         self.bot = bot
-        self.action_type = action_type  # "taken" or "skipped"
+        self.action_type = action_type  # "taken" or "home"
+        self.restore_missed = restore_missed  # 取り消し時に戻す持ち越し錠数
         self.message = None  # confirm/skip ハンドラで設定される
 
     @discord.ui.button(label="取り消す ↩️", style=discord.ButtonStyle.danger)
     async def undo(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.action_type == "taken":
             self.bot.is_taken = False
+            self.bot.missed_doses = self.restore_missed
             label = "服用記録"
-        else:
-            self.bot.is_skipped = False
-            label = "スキップ"
+        else:  # "home"
+            self.bot.is_home_waiting = False
+            self.bot._cancel_home()
+            label = "家に帰って飲む設定"
 
         button.disabled = True
         await interaction.response.edit_message(
             content=f"✅ {interaction.user.display_name} が{label}を取り消しました。通知を再開します 🔔",
             view=self
         )
-        # 即座にリマインドを再送信
         await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。")
 
     async def on_timeout(self):
-        """60秒経過でボタンを無効化してメッセージを更新する"""
-        for item in self.children:
-            item.disabled = True
+        self.clear_items()
         if self.message:
             try:
                 await self.message.edit(
