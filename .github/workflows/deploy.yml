@@ -36,6 +36,7 @@ jobs:
 
       - run: pip install --quiet -r requirements.txt
       - run: python -m py_compile medicine_bot.py
+      - run: python -m unittest discover tests
       - run: bash -n deploy/medicine-bot-deploy deploy/setup-server.sh
 
   deploy:
