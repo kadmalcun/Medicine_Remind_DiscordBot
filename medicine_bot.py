@@ -20,6 +20,11 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "medicine_log.jsonl")
 
+# 通知の片付け後にチャンネルへ残す1行の先頭。起動時の掃除でもこの行だけは残す
+SUMMARY_PREFIX = "📝"
+CLEANUP_HISTORY_LIMIT = 200  # 起動時の掃除で遡るメッセージ数
+NOTICE_DELETE_AFTER = 300  # 再通知設定のお知らせを自動で消すまでの秒数
+
 def normalize_time(text):
     """HH:MM 形式の文字列をゼロ埋めした形に整える（不正なら ValueError）"""
     return datetime.strptime(text.strip(), "%H:%M").strftime("%H:%M")
@@ -66,6 +71,8 @@ class MedicineBot(commands.Bot):
         self.retry_interval = config["retry_interval"]  # 追いかけ通知間隔（分）
         self._snooze_task = None  # スヌーズ用のタスク
         self.active_views: list = []  # アクティブな MedicineView を追跡
+        self.cycle_messages: list = []  # 片付け対象のその日のメッセージ
+        self.summary = None  # 完了・スキップ時に残す1行（取り消されたら None）
 
     async def setup_hook(self):
         # 初回起動時は .env の値で config.json を作成しておく
@@ -74,12 +81,31 @@ class MedicineBot(commands.Bot):
         await self.tree.sync()
         self.main_loop.start()
 
+    async def cleanup_old_messages(self):
+        """再起動前に送った通知を削除する（服薬記録の1行は残す）"""
+        channel = self.get_channel(CHANNEL_ID)
+        if not channel:
+            return
+        try:
+            async for message in channel.history(limit=CLEANUP_HISTORY_LIMIT):
+                if message.author == self.user and not message.content.startswith(SUMMARY_PREFIX):
+                    await self._delete_messages([message])
+        except discord.Forbidden:
+            print("⚠️ メッセージ履歴を読む権限がないため、古い通知を削除できませんでした")
+
     @tasks.loop(minutes=1)
     async def main_loop(self):
         now = datetime.now().strftime("%H:%M")
         now_dt = datetime.now()
 
         if now == self.remind_time:
+            # 前日分が未記録のまま残っていれば片付けて「記録なし」を残す
+            if self.cycle_messages:
+                first = self.cycle_messages[0].created_at.astimezone()
+                self.summary = f"{SUMMARY_PREFIX} {first:%m/%d} ❓ 服薬の記録がありませんでした"
+                await self.record_event("missed")
+                await self.finish_cycle()
+            self.summary = None
             self.is_taken = False
             self.is_skipped = False
             self.is_snoozed = False
@@ -96,15 +122,55 @@ class MedicineBot(commands.Bot):
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
                     await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！（{self.retry_interval}分おきに通知中）", kind="retry")
 
+    @main_loop.before_loop
+    async def before_main_loop(self):
+        await self.wait_until_ready()
+        await self.cleanup_old_messages()
+
     async def send_reminder(self, text, kind):
         """kind: scheduled（定刻）/ retry（追いかけ）/ snooze（スヌーズ後）/ resume（取り消し後）"""
         channel = self.get_channel(CHANNEL_ID)
         if channel:
+            old_views, self.active_views = self.active_views, []
             view = MedicineView(self)
             message = await channel.send(f"@everyone {text}", view=view)
             view.message = message
             self.active_views.append(view)
+            self.track_message(message)
             await self.record_event("reminder_sent", detail={"kind": kind})
+
+            # 古い通知は消して、ボタン付きの通知を常に最新の1件だけにする
+            old_messages = [v.message for v in old_views if v.message]
+            for old_view in old_views:
+                old_view.stop()
+            old_ids = {m.id for m in old_messages}
+            self.cycle_messages = [m for m in self.cycle_messages if m.id not in old_ids]
+            await self._delete_messages(old_messages)
+
+    def track_message(self, message):
+        """完了・スキップ後にまとめて削除するメッセージとして登録する"""
+        channel = self.get_channel(CHANNEL_ID)
+        if message and channel:
+            # フォローアップは15分で webhook 経由の削除ができなくなるため、チャンネル側の参照で持つ
+            self.cycle_messages.append(channel.get_partial_message(message.id))
+
+    async def _delete_messages(self, messages):
+        for message in messages:
+            try:
+                await message.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    async def finish_cycle(self):
+        """その日の通知をまとめて削除し、記録を1行だけ残す"""
+        messages, self.cycle_messages = self.cycle_messages, []
+        for view in self.active_views:
+            view.stop()
+        self.active_views.clear()
+        await self._delete_messages(messages)
+        channel = self.get_channel(CHANNEL_ID)
+        if channel and self.summary:
+            await channel.send(self.summary)
 
     async def save_config(self):
         """現在の設定を config.json に保存する"""
@@ -204,7 +270,8 @@ async def set_snooze(interaction: discord.Interaction, hours: float):
 
     await interaction.response.send_message(
         f"🔔 {interaction.user.display_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤",
-        ephemeral=False
+        ephemeral=False,
+        delete_after=NOTICE_DELETE_AFTER
     )
 
 class MedicineView(discord.ui.View):
@@ -222,6 +289,7 @@ class MedicineView(discord.ui.View):
         self.bot.is_taken = True
         self.bot._cancel_snooze()
         await self.bot.record_event("taken", user=interaction.user)
+        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ✅ {interaction.user.display_name} が服用しました"
         await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を停止します ✨", False)
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="taken")
@@ -230,6 +298,7 @@ class MedicineView(discord.ui.View):
             view=undo_view
         )
         undo_view.message = undo_msg
+        self.bot.track_message(undo_msg)
 
     @discord.ui.button(label="今日は飲まない ⏭️", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -239,6 +308,7 @@ class MedicineView(discord.ui.View):
         self.bot.is_skipped = True
         self.bot._cancel_snooze()
         await self.bot.record_event("skipped", user=interaction.user)
+        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ⏭️ {interaction.user.display_name} が今日の分をスキップしました"
         await self.disable_all_buttons(interaction, f"⏭️ {interaction.user.display_name} が今日の分をスキップしました。通知を停止します 💤", False)
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="skipped")
@@ -247,6 +317,7 @@ class MedicineView(discord.ui.View):
             view=undo_view
         )
         undo_view.message = undo_msg
+        self.bot.track_message(undo_msg)
 
     @discord.ui.button(label="後で通知 🔔", style=discord.ButtonStyle.primary)
     async def snooze(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -272,7 +343,9 @@ class MedicineView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
-        await interaction.followup.send(message, ephemeral=is_ephemeral)
+        followup = await interaction.followup.send(message, ephemeral=is_ephemeral, wait=True)
+        if not is_ephemeral:
+            self.bot.track_message(followup)
 
     async def _disable_other_active_views(self):
         """このビュー以外のアクティブな MedicineView のボタンを無効化する"""
@@ -326,7 +399,8 @@ class SnoozeSelectView(discord.ui.View):
         channel = self.bot.get_channel(CHANNEL_ID)
         if channel:
             await channel.send(
-                f"🔔 {self.user_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤"
+                f"🔔 {self.user_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤",
+                delete_after=NOTICE_DELETE_AFTER
             )
 
     async def on_timeout(self):
@@ -350,6 +424,8 @@ class UndoActionView(discord.ui.View):
             self.bot.is_skipped = False
             label = "スキップ"
         await self.bot.record_event(f"undo_{self.action_type}", user=interaction.user)
+        self.bot.summary = None
+        self.stop()  # 取り消し済みなので期限切れの片付けは行わない
 
         button.disabled = True
         await interaction.response.edit_message(
@@ -360,16 +436,7 @@ class UndoActionView(discord.ui.View):
         await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。", kind="resume")
 
     async def on_timeout(self):
-        """60秒経過でボタンを無効化してメッセージを更新する"""
-        for item in self.children:
-            item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(
-                    content="↩️ 取り消し期限が切れました（60秒経過）",
-                    view=self
-                )
-            except (discord.NotFound, discord.HTTPException):
-                pass
+        """取り消し期限（60秒）が過ぎたら、その日の通知を片付けて1行だけ残す"""
+        await self.bot.finish_cycle()
 
 bot.run(TOKEN)
