@@ -252,7 +252,7 @@ class MedicineBot(commands.Bot):
                 if passed_min < 0:
                     passed_min += 24 * 60  # 0時跨ぎ対応
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
-                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！（{self.retry_interval}分おきに通知中）", kind="retry")
+                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！{self.retry_interval}分おきにお知らせしています。", kind="retry")
 
     @main_loop.before_loop
     async def before_main_loop(self):
@@ -267,9 +267,9 @@ class MedicineBot(commands.Bot):
             return (
                 f"{title}\n"
                 f"⚠️ 前日までの分を飲み忘れています。今日の分と合わせて **{total}錠** 飲んでください。\n"
-                "飲んだら「完了」、後で飲む場合は「家に帰って飲む」を押してください。"
+                "飲んだら「完了」を、後で飲むときは「家に帰って飲む」を押してください。"
             )
-        return f"{title}\n飲んだら「完了」、後で飲む場合は「家に帰って飲む」を押してください。"
+        return f"{title}\n飲んだら「完了」を、後で飲むときは「家に帰って飲む」を押してください。"
 
     async def cleanup_old_messages(self):
         """再起動前に送った通知を削除する（服薬記録の1行は残す）"""
@@ -317,7 +317,7 @@ class MedicineBot(commands.Bot):
             status = "完了"
         else:
             # 起動時の掃除でボタン付きの通知も消えているので、送り直す
-            await self.send_reminder(self.reminder_text("🔄 **Botを再起動しました。お薬の確認ができていません！**"), kind="restart")
+            await self.send_reminder(self.reminder_text("🔄 **Botを再起動しました**\nお薬の確認ができていません！"), kind="restart")
             status = "未完了"
         print(f"ℹ️ 服薬状況を復元しました: {status}（持ち越し {self.missed_doses}錠）")
 
@@ -414,8 +414,8 @@ class MedicineBot(commands.Bot):
             if not self.is_taken and not self.is_home_waiting:
                 display = format_hours(snooze_hours)
                 await self.send_reminder(
-                    f"🔔 **再通知（{display}後）**\n"
-                    f"お薬の時間を先送りしていました。飲んだら「完了」を押してください。",
+                    f"🔔 **再通知**\n"
+                    f"{display}先送りしていたお薬の時間です。飲んだら「完了」を押してください。",
                     kind="snooze"
                 )
         except asyncio.CancelledError:
@@ -471,8 +471,8 @@ def format_hours(hours):
 
 bot = MedicineBot()
 
-@bot.tree.command(name="interval", description="追いかけ通知の間隔（分）を設定します")
-@app_commands.describe(minutes="通知する間隔を分単位で入力してください（例: 15）")
+@bot.tree.command(name="interval", description="追いかけ通知の間隔を分単位で設定します")
+@app_commands.describe(minutes="通知する間隔を分単位で入力してください。例: 15")
 async def set_interval(interaction: discord.Interaction, minutes: int):
     if minutes < 1:
         await interaction.response.send_message("1分以上の間隔を設定してください。", ephemeral=True)
@@ -483,20 +483,20 @@ async def set_interval(interaction: discord.Interaction, minutes: int):
     await interaction.response.send_message(f"✅ 追いかけ通知の間隔を **{minutes}分** に設定しました。", ephemeral=False)
 
 @bot.tree.command(name="remind_time", description="毎日のリマインド時刻を設定します")
-@app_commands.describe(time="リマインドする時刻をHH:MM形式で入力してください（例: 13:00）")
+@app_commands.describe(time="リマインドする時刻をHH:MM形式で入力してください。例: 13:00")
 async def set_remind_time(interaction: discord.Interaction, time: str):
     try:
         new_time = normalize_time(time)
     except ValueError:
-        await interaction.response.send_message("HH:MM形式（例: 13:00）で入力してください。", ephemeral=True)
+        await interaction.response.send_message("13:00 のように、HH:MM形式で入力してください。", ephemeral=True)
         return
 
     bot.remind_time = new_time
     await bot.save_config()
     await interaction.response.send_message(f"✅ リマインド時刻を **{new_time}** に設定しました。", ephemeral=False)
 
-@bot.tree.command(name="snooze", description="指定した時間後に再通知します（即時スヌーズ）")
-@app_commands.describe(hours="再通知するまでの時間を入力してください（例: 2）")
+@bot.tree.command(name="snooze", description="今すぐスヌーズし、指定した時間後に再通知します")
+@app_commands.describe(hours="再通知するまでの時間を入力してください。例: 2")
 async def set_snooze(interaction: discord.Interaction, hours: float):
     if hours <= 0:
         await interaction.response.send_message("0より大きい値を設定してください。", ephemeral=True)
@@ -506,7 +506,7 @@ async def set_snooze(interaction: discord.Interaction, hours: float):
     await bot.start_snooze(hours, interaction.user)
 
     await interaction.response.send_message(
-        f"🔔 {interaction.user.display_name} が再通知を設定しました。**{display}後**にもう一度お知らせします 💤",
+        f"🔔 {interaction.user.display_name} が再通知を設定しました。**{display}後**にもう一度お知らせします。",
         ephemeral=False,
         delete_after=NOTICE_DELETE_AFTER
     )
@@ -528,13 +528,13 @@ class MedicineView(discord.ui.View):
         prev_missed = self.bot.missed_doses
         self.bot.missed_doses = 0
         await self.bot.record_event("taken", user=interaction.user, detail={"missed_doses": 0, "prev_missed_doses": prev_missed})
-        doses = f"（前日までの分と合わせて{prev_missed + 1}錠）" if prev_missed else ""
-        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ✅ {interaction.user.display_name} が服用しました{doses}"
-        await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を停止します ✨", False)
+        doses = f"前日までの分と合わせて{prev_missed + 1}錠を" if prev_missed else ""
+        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ✅ {interaction.user.display_name} が{doses}服用しました"
+        await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を止めます。", False)
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="taken", restore_missed=prev_missed)
         undo_msg = await interaction.channel.send(
-            "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
+            "↩️ 間違えたときは、60秒以内ならこちらから取り消せます。",
             view=undo_view
         )
         undo_view.message = undo_msg
@@ -552,13 +552,13 @@ class MedicineView(discord.ui.View):
         await self.bot.record_event("home", user=interaction.user)
         await self.disable_all_buttons(
             interaction,
-            f"🏠 {interaction.user.display_name} が「家に帰って飲む」を設定しました。**{HOME_REMIND_HOUR}:00** に再通知します 💤",
+            f"🏠 {interaction.user.display_name} が「家に帰って飲む」を設定しました。**{HOME_REMIND_HOUR}:00** に再通知します。",
             False
         )
         await self._disable_other_active_views()
         undo_view = UndoActionView(self.bot, action_type="home")
         undo_msg = await interaction.channel.send(
-            "↩️ 間違えた場合はこちらから取り消せます（60秒以内）",
+            "↩️ 間違えたときは、60秒以内ならこちらから取り消せます。",
             view=undo_view
         )
         undo_view.message = undo_msg
@@ -618,7 +618,8 @@ class SnoozeSelect(discord.ui.Select):
             time_str = notify_dt.strftime("%H:%M")
             duration_str = format_hours(hours)
             options.append(discord.SelectOption(
-                label=f"{time_str}（{duration_str}後）",
+                label=f"{duration_str}後",
+                description=f"{time_str} にお知らせします",
                 value=value,
                 emoji=emoji
             ))
@@ -632,13 +633,13 @@ class SnoozeSelect(discord.ui.Select):
         await self._bot.start_snooze(snooze_hours, interaction.user)
 
         await interaction.response.edit_message(
-            content=f"✅ **{time_str}**（{duration_str}後）に再通知します。",
+            content=f"✅ {duration_str}後の **{time_str}** に再通知します。",
             view=None
         )
         channel = self._bot.get_channel(CHANNEL_ID)
         if channel:
             await channel.send(
-                f"🔔 {self._user_name} が再通知を設定しました。**{time_str}**（{duration_str}後）にもう一度お知らせします 💤",
+                f"🔔 {self._user_name} が再通知を設定しました。{duration_str}後の **{time_str}** にもう一度お知らせします。",
                 delete_after=NOTICE_DELETE_AFTER
             )
 
@@ -678,7 +679,7 @@ class UndoActionView(discord.ui.View):
 
         button.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ {interaction.user.display_name} が{label}を取り消しました。通知を再開します 🔔",
+            content=f"✅ {interaction.user.display_name} が{label}を取り消しました。通知を再開します。",
             view=self
         )
         await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。", kind="resume")
@@ -693,7 +694,7 @@ class UndoActionView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(
-                    content="↩️ 取り消し期限が切れました（60秒経過）",
+                    content="↩️ 60秒が過ぎたので、取り消せなくなりました。",
                     view=self
                 )
             except (discord.NotFound, discord.HTTPException):
