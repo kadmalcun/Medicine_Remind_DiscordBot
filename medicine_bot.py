@@ -252,7 +252,7 @@ class MedicineBot(commands.Bot):
                 if passed_min < 0:
                     passed_min += 24 * 60  # 0時跨ぎ対応
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
-                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！{self.retry_interval}分おきにお知らせしています。", kind="retry")
+                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！", kind="retry")
 
     @main_loop.before_loop
     async def before_main_loop(self):
@@ -528,17 +528,16 @@ class MedicineView(discord.ui.View):
         prev_missed = self.bot.missed_doses
         self.bot.missed_doses = 0
         await self.bot.record_event("taken", user=interaction.user, detail={"missed_doses": 0, "prev_missed_doses": prev_missed})
-        doses = f"前日までの分と合わせて{prev_missed + 1}錠を" if prev_missed else ""
-        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ✅ {interaction.user.display_name} が{doses}服用しました"
-        await self.disable_all_buttons(interaction, f"✅ {interaction.user.display_name} が服用を記録しました。通知を止めます。", False)
-        await self._disable_other_active_views()
+        doses = f"前日までの分と合わせて{prev_missed + 1}錠の" if prev_missed else ""
+        self.bot.summary = f"{SUMMARY_PREFIX} {datetime.now():%m/%d %H:%M} ✅ {interaction.user.display_name} が{doses}服用を記録しました"
+        # 取り消しボタンは、記録したことを知らせるメッセージに付ける
         undo_view = UndoActionView(self.bot, action_type="taken", restore_missed=prev_missed)
-        undo_msg = await interaction.channel.send(
-            "↩️ 間違えたときは、60秒以内ならこちらから取り消せます。",
-            view=undo_view
+        await self.disable_all_buttons(
+            interaction,
+            f"✅ {interaction.user.display_name} が服用を記録しました。通知を止めます。",
+            undo_view
         )
-        undo_view.message = undo_msg
-        self.bot.track_message(undo_msg)
+        await self._disable_other_active_views()
 
     @discord.ui.button(label="家に帰って飲む 🏠", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -550,19 +549,13 @@ class MedicineView(discord.ui.View):
         self.bot._cancel_home()
         self.bot._home_task = asyncio.create_task(self.bot._home_reminder())
         await self.bot.record_event("home", user=interaction.user)
+        undo_view = UndoActionView(self.bot, action_type="home")
         await self.disable_all_buttons(
             interaction,
             f"🏠 {interaction.user.display_name} が「家に帰って飲む」を設定しました。**{HOME_REMIND_HOUR}:00** に再通知します。",
-            False
+            undo_view
         )
         await self._disable_other_active_views()
-        undo_view = UndoActionView(self.bot, action_type="home")
-        undo_msg = await interaction.channel.send(
-            "↩️ 間違えたときは、60秒以内ならこちらから取り消せます。",
-            view=undo_view
-        )
-        undo_view.message = undo_msg
-        self.bot.track_message(undo_msg)
 
     @discord.ui.button(label="後で通知 🔔", style=discord.ButtonStyle.primary)
     async def snooze(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -581,12 +574,13 @@ class MedicineView(discord.ui.View):
         await interaction.response.edit_message(view=self)
         await interaction.followup.send("✋ 今日の服薬は既に記録済みです。", ephemeral=True)
 
-    async def disable_all_buttons(self, interaction, message, is_ephemeral):
+    async def disable_all_buttons(self, interaction, message, undo_view):
+        """押された通知のボタンを消し、結果のメッセージを取り消しボタン付きで送る"""
         self.clear_items()
         await interaction.response.edit_message(view=self)
-        followup = await interaction.followup.send(message, ephemeral=is_ephemeral, wait=True)
-        if not is_ephemeral:
-            self.bot.track_message(followup)
+        followup = await interaction.followup.send(message, view=undo_view, wait=True)
+        undo_view.message = followup
+        self.bot.track_message(followup)
 
     async def _disable_other_active_views(self):
         others = [v for v in self.bot.active_views if v is not self]
@@ -660,7 +654,7 @@ class UndoActionView(discord.ui.View):
         self.bot = bot
         self.action_type = action_type  # "taken" or "home"
         self.restore_missed = restore_missed  # 取り消し時に戻す持ち越し錠数
-        self.message = None  # confirm/skip ハンドラで設定される
+        self.message = None  # MedicineView.disable_all_buttons で設定される
 
     @discord.ui.button(label="取り消す ↩️", style=discord.ButtonStyle.danger)
     async def undo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -677,7 +671,7 @@ class UndoActionView(discord.ui.View):
             label = "家に帰って飲む設定"
         self.stop()  # 取り消し済みなので期限切れの処理は行わない
 
-        button.disabled = True
+        self.clear_items()
         await interaction.response.edit_message(
             content=f"✅ {interaction.user.display_name} が{label}を取り消しました。通知を再開します。",
             view=self
@@ -689,14 +683,11 @@ class UndoActionView(discord.ui.View):
             # 取り消し期限（60秒）が過ぎたら、その日の通知を片付けて1行だけ残す
             await self.bot.finish_cycle()
             return
-        # 「家に帰って飲む」はまだその日が終わっていないので、ボタンだけ消す
+        # 「家に帰って飲む」はまだその日が終わっていないので、取り消しボタンだけ消す
         self.clear_items()
         if self.message:
             try:
-                await self.message.edit(
-                    content="↩️ 60秒が過ぎたので、取り消せなくなりました。",
-                    view=self
-                )
+                await self.message.edit(view=self)
             except (discord.NotFound, discord.HTTPException):
                 pass
 
