@@ -52,6 +52,22 @@ def _write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)  # 書き込み途中で落ちても壊れないよう置き換え
 
+def _read_log_events():
+    """medicine_log.jsonl の全イベントを読み込む（壊れた行は読み飛ばす）"""
+    events = []
+    try:
+        with open(LOG_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    entry["ts"] = datetime.fromisoformat(entry["ts"])
+                    events.append(entry)
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return events
+
 def _append_line(path, line):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -126,6 +142,51 @@ class MedicineBot(commands.Bot):
     async def before_main_loop(self):
         await self.wait_until_ready()
         await self.cleanup_old_messages()
+        await self.restore_today_state()
+
+    async def restore_today_state(self):
+        """再起動前の当日の服薬状況をログから復元する"""
+        now = datetime.now().astimezone()
+        remind_h, remind_m = map(int, self.remind_time.split(":"))
+        cycle_start = now.replace(hour=remind_h, minute=remind_m, second=0, microsecond=0)
+        if now < cycle_start:
+            return  # リマインド時刻前は追いかけ通知が出ないので復元不要
+
+        try:
+            events = await asyncio.to_thread(_read_log_events)
+        except OSError as e:
+            print(f"⚠️ ログを読み込めませんでした: {e}")
+            return
+
+        snooze_until = None
+        for entry in events:
+            if entry["ts"].tzinfo is None or entry["ts"] < cycle_start:
+                continue
+            event = entry.get("event")
+            if event == "taken":
+                self.is_taken = True
+                snooze_until = None  # 完了・スキップでスヌーズは取り消される
+            elif event == "skipped":
+                self.is_skipped = True
+                snooze_until = None
+            elif event == "undo_taken":
+                self.is_taken = False
+            elif event == "undo_skipped":
+                self.is_skipped = False
+            elif event == "snoozed":
+                hours = float(entry.get("detail", {}).get("hours", 0))
+                snooze_until = (entry["ts"], hours)
+
+        if snooze_until and not self.is_taken and not self.is_skipped:
+            snoozed_at, hours = snooze_until
+            remaining = (snoozed_at - now).total_seconds() + hours * 3600
+            if remaining > 0:
+                self.is_snoozed = True
+                self._snooze_task = asyncio.create_task(self._snooze_reminder(hours, delay_seconds=remaining))
+
+        if self.is_taken or self.is_skipped or self.is_snoozed:
+            state = "完了" if self.is_taken else "スキップ" if self.is_skipped else "スヌーズ中"
+            print(f"ℹ️ 今日の服薬状況を復元しました: {state}")
 
     async def send_reminder(self, text, kind):
         """kind: scheduled（定刻）/ retry（追いかけ）/ snooze（スヌーズ後）/ resume（取り消し後）"""
@@ -194,10 +255,10 @@ class MedicineBot(commands.Bot):
         except OSError as e:
             print(f"⚠️ ログを記録できませんでした: {e}")
 
-    async def _snooze_reminder(self, snooze_hours):
-        """スヌーズ時間が経過した後に再通知を送信する"""
+    async def _snooze_reminder(self, snooze_hours, delay_seconds=None):
+        """スヌーズ時間が経過した後に再通知を送信する（delay_seconds は再起動後の残り時間）"""
         try:
-            await asyncio.sleep(snooze_hours * 3600)
+            await asyncio.sleep(snooze_hours * 3600 if delay_seconds is None else delay_seconds)
             # スヌーズ解除して再通知
             self.is_snoozed = False
             if not self.is_taken and not self.is_skipped:
