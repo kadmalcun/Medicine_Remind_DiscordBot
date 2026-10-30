@@ -107,8 +107,8 @@ After=network.target
 User=paladmin
 WorkingDirectory=/home/paladmin/bot
 
-# 実行するコマンド（python3の絶対パスとファイルの絶対パス）
-ExecStart=/usr/bin/python3 /home/paladmin/bot/medicine_bot.py
+# 実行するコマンド（venv内のpython3の絶対パスとファイルの絶対パス）
+ExecStart=/home/paladmin/bot/venv/bin/python3 /home/paladmin/bot/medicine_bot.py
 
 # エラーで落ちた場合、常に自動再起動する設定
 Restart=always
@@ -156,5 +156,38 @@ sudo systemctl status medicine_bot.service
 * **Botを止める:** `sudo systemctl stop medicine_bot.service`
 * **Botを再起動する:** `sudo systemctl restart medicine_bot.service`
 * **ログを見る:** `journalctl -u medicine_bot.service -e`
+
+---
+
+### 🤖 GitHub Actions による自動デプロイ
+
+`main` ブランチに push すると、`.github/workflows/deploy.yml` が次の順で実行されます。Actions 画面の「Run workflow」から手動でも実行できます。
+
+1. GitHub のランナーで依存パッケージのインストールと構文チェック
+2. サーバー上のセルフホストランナーで `/home/paladmin/bot` にファイルを配置（`.env` と `venv/` はサーバー側のものを残します）
+3. `venv` に依存パッケージをインストール
+4. `medicine_bot.service` を再起動し、起動したことを確認
+
+#### 初回セットアップ（サーバー側）
+
+1. **venv を作る:** 上のサービス設定は `venv` の Python を使います。
+   ```bash
+   sudo apt install python3-venv rsync
+   cd /home/paladmin/bot
+   python3 -m venv venv
+   venv/bin/pip install -r requirements.txt
+   ```
+2. **セルフホストランナーを登録する:** GitHub のリポジトリの **Settings > Actions > Runners > New self-hosted runner** の手順に従い、`paladmin` ユーザーでランナーをインストールします。`config.sh` の実行時にラベル `palserver` を追加してください。
+   ```bash
+   ./config.sh --url https://github.com/kadmalcun/Medicine_Remind_DiscordBot --token <表示されたトークン> --labels palserver
+   sudo ./svc.sh install paladmin
+   sudo ./svc.sh start
+   ```
+3. **再起動だけパスワードなしで sudo できるようにする:** `sudo visudo -f /etc/sudoers.d/medicine_bot` で次の1行を書き込みます。
+   ```
+   paladmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart medicine_bot.service
+   ```
+
+> **⚠️ 注意:** このリポジトリは公開リポジトリです。セルフホストランナーはフォークからのPRでもコードを実行できてしまうため、**Settings > Actions > General > Fork pull request workflows from outside collaborators** を「Require approval for all external contributors」にしておいてください。
 
 最初は少し難しく感じるかもしれませんが、一度設定してしまうと放置でずっと動き続けてくれるので、非常に快適になりますよ！ぜひ試してみてください。

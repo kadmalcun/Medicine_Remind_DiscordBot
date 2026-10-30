@@ -1,0 +1,71 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# デプロイが同時に走らないようにする（実行中のものは止めない）
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存パッケージのインストール
+        run: pip install -r requirements.txt
+
+      - name: 構文チェック
+        run: python -m py_compile medicine_bot.py
+
+  deploy:
+    needs: check
+    # palserver 上のセルフホストランナー（paladmin ユーザーで実行）
+    runs-on: [self-hosted, palserver]
+    env:
+      DEPLOY_DIR: /home/paladmin/bot
+      SERVICE: medicine_bot.service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ファイルを配置
+        # .env と venv はサーバー側のものを残す
+        run: |
+          mkdir -p "$DEPLOY_DIR"
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude 'venv/' \
+            ./ "$DEPLOY_DIR/"
+
+      - name: 依存パッケージのインストール
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          [ -d venv ] || python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install -r requirements.txt
+
+      - name: サービスを再起動
+        run: sudo systemctl restart "$SERVICE"
+
+      - name: 起動を確認
+        run: |
+          sleep 10
+          if ! systemctl is-active --quiet "$SERVICE"; then
+            journalctl -u "$SERVICE" -n 50 --no-pager || true
+            exit 1
+          fi
+          echo "$SERVICE is active"
