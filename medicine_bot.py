@@ -252,7 +252,7 @@ class MedicineBot(commands.Bot):
                 if passed_min < 0:
                     passed_min += 24 * 60  # 0時跨ぎ対応
                 if passed_min > 0 and passed_min % self.retry_interval == 0:
-                    await self.send_reminder(f"⚠️ **未完了通知**\nお薬の確認ができていません！", kind="retry")
+                    await self.send_reminder(self.reminder_text("⚠️ **未完了通知**", "お薬の確認ができていません！"), kind="retry")
 
     @main_loop.before_loop
     async def before_main_loop(self):
@@ -260,16 +260,14 @@ class MedicineBot(commands.Bot):
         await self.cleanup_old_messages()
         await self.restore_from_log()
 
-    def reminder_text(self, title):
-        """定刻・再開時の通知文（持ち越しがあれば合計錠数を添える）"""
+    def reminder_text(self, title, body="飲んだら「完了」を、後で飲むときは「家に帰って飲む」を押してください。"):
+        """通知文を組み立てる（持ち越しがあれば、見出しの次に合計錠数を添える）"""
+        lines = [title]
         if self.missed_doses > 0:
             total = self.missed_doses + 1
-            return (
-                f"{title}\n"
-                f"⚠️ 前日までの分を飲み忘れています。今日の分と合わせて **{total}錠** 飲んでください。\n"
-                "飲んだら「完了」を、後で飲むときは「家に帰って飲む」を押してください。"
-            )
-        return f"{title}\n飲んだら「完了」を、後で飲むときは「家に帰って飲む」を押してください。"
+            lines.append(f"⚠️ 前日までの分を飲み忘れています。今日の分と合わせて **{total}錠** 飲んでください。")
+        lines.append(body)
+        return "\n".join(lines)
 
     async def cleanup_old_messages(self):
         """再起動前に送った通知を削除する（服薬記録の1行は残す）"""
@@ -414,8 +412,7 @@ class MedicineBot(commands.Bot):
             if not self.is_taken and not self.is_home_waiting:
                 display = format_hours(snooze_hours)
                 await self.send_reminder(
-                    f"🔔 **再通知**\n"
-                    f"{display}先送りしていたお薬の時間です。飲んだら「完了」を押してください。",
+                    self.reminder_text("🔔 **再通知**", f"{display}先送りしていたお薬の時間です。飲んだら「完了」を押してください。"),
                     kind="snooze"
                 )
         except asyncio.CancelledError:
@@ -431,8 +428,7 @@ class MedicineBot(commands.Bot):
             self.is_home_waiting = False
             if not self.is_taken:
                 await self.send_reminder(
-                    "🏠 **お帰りなさい！お薬の時間です！**\n"
-                    "飲んだら「完了」を押してください。",
+                    self.reminder_text("🏠 **お帰りなさい！お薬の時間です！**", "飲んだら「完了」を押してください。"),
                     kind="home"
                 )
         except asyncio.CancelledError:
@@ -676,7 +672,7 @@ class UndoActionView(discord.ui.View):
             content=f"✅ {interaction.user.display_name} が{label}を取り消しました。通知を再開します。",
             view=self
         )
-        await self.bot.send_reminder("💊 **通知を再開しました！**\n飲んだら「完了」を押してください。", kind="resume")
+        await self.bot.send_reminder(self.bot.reminder_text("💊 **通知を再開しました！**", "飲んだら「完了」を押してください。"), kind="resume")
 
     async def on_timeout(self):
         if self.action_type == "taken":
