@@ -176,11 +176,22 @@ class FileTest(unittest.TestCase):
         mb.CONFIG_PATH = self.path("config.json")
         default = mb.normalize_time(mb.DEFAULT_REMIND_TIME)
 
-        self.assertEqual(mb.load_config(), {"remind_time": default, "retry_interval": 60})
+        dose = {"dose_gap_hours": 6, "dose_deadline": "23:00"}
+        self.assertEqual(mb.load_config(), {"remind_time": default, "retry_interval": 60, **dose})
 
         with open(mb.CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump({"remind_time": "8:00", "retry_interval": 0}, f)
-        self.assertEqual(mb.load_config(), {"remind_time": "08:00", "retry_interval": 1})
+        self.assertEqual(mb.load_config(), {"remind_time": "08:00", "retry_interval": 1, **dose})
+
+        with open(mb.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"dose_gap_hours": 4.5, "dose_deadline": "22:30"}, f)
+        config = mb.load_config()
+        self.assertEqual((config["dose_gap_hours"], config["dose_deadline"]), (4.5, "22:30"))
+
+        # 間隔が0以下なら設定ファイル全体を読み込まず初期値にする（ほかの壊れ方と同じ扱い）
+        with open(mb.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"dose_gap_hours": 0}, f)
+        self.assertEqual(mb.load_config()["dose_gap_hours"], 6)
 
         for broken in ("{broken", '{"remind_time": "99:99"}', "[]"):
             with open(mb.CONFIG_PATH, "w", encoding="utf-8") as f:
