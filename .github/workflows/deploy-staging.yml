@@ -1,7 +1,7 @@
 # テスト用 Bot へのデプロイ
 #
 # 手動実行のみ。Actions 画面（または gh workflow run deploy-staging.yml --ref <ブランチ>）で
-# ブランチを選ぶと、そのブランチを palserver のテスト用 Bot に入れる。
+# ブランチを選ぶと、そのブランチを bots コンテナ（CT108）のテスト用 Bot に入れる。
 # 本番と同じサーバー・同じ Python・同じデプロイスクリプトで、配置先と .env だけが違う。
 name: Deploy (staging)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# palserver の初期設定（root で一度だけ実行する。何度実行しても同じ状態になる）
+# bots コンテナ（CT108）の初期設定（root で一度だけ実行する。何度実行しても同じ状態になる）
 #
 #   sudo RUNNER_TOKEN=<登録トークン> bash deploy/setup-server.sh
 #
@@ -16,13 +16,13 @@ set -euo pipefail
 REPO_URL=https://github.com/kadmalcun/Medicine_Remind_DiscordBot
 RUNNER_USER=gh-runner
 RUNNER_DIR=/home/$RUNNER_USER/medicine-runner
-RUNNER_NAME=palserver-medicine
+RUNNER_NAME=bots-medicine
 RUNNER_LABEL=medicine-bot
 DEPLOY_BIN=/usr/local/sbin/medicine-bot-deploy
 DEPLOY_BIN_STAGING=/usr/local/sbin/medicine-bot-deploy-staging
 SUDOERS=/etc/sudoers.d/medicine-bot
-BOT_USER=paladmin
-STAGING_DIR=/home/paladmin/bot/medicine_notice_bot_staging
+BOT_USER=bots
+STAGING_DIR=/home/bots/bot/medicine_notice_bot_staging
 STAGING_SERVICE=medicine_bot_staging.service
 
 log()  { printf '  %s\n' "$*"; }
