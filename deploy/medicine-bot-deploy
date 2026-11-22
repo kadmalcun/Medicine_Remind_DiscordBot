@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# デプロイスクリプト（palserver 上で root として実行される）
+# デプロイスクリプト（bots コンテナ（CT108）上で root として実行される）
 #
 # ★重要: このファイルは「原本」。実際に実行されるのは /usr/local/sbin/ に設置した
 #   root 所有のコピーのほう。リポジトリ内のスクリプトをそのまま sudo 実行する
@@ -18,16 +18,16 @@ set -euo pipefail
 # セルフホストランナーのチェックアウト先（固定）。
 # <ランナーのルート>/_work/<リポジトリ名>/<リポジトリ名> という構成
 SRC=/home/gh-runner/medicine-runner/_work/Medicine_Remind_DiscordBot/Medicine_Remind_DiscordBot
-OWNER=paladmin
+OWNER=bots
 
 case $(basename "$0") in
   medicine-bot-deploy)
-    DEST=/home/paladmin/bot/medicine_notice_bot
+    DEST=/home/bots/bot/medicine_notice_bot
     SERVICE=medicine_bot.service
     BACKUP_ROOT=/var/backups/medicine-bot
     ;;
   medicine-bot-deploy-staging)
-    DEST=/home/paladmin/bot/medicine_notice_bot_staging
+    DEST=/home/bots/bot/medicine_notice_bot_staging
     SERVICE=medicine_bot_staging.service
     BACKUP_ROOT=/var/backups/medicine-bot-staging
     ;;

@@ -122,7 +122,7 @@ Botと同じフォルダの `data/` に以下のファイルが自動で作ら�
 ```bash
 sudo nano /etc/systemd/system/medicine_bot.service
 ```
-*(※パスワードを聞かれたら、paladminユーザーのパスワードを入力してください)*
+*(※ Bot は `bots` ユーザーで動かします)*
 
 #### ステップ2：設定を書き込む
 開いた真っ黒な画面に、以下の内容をそのままコピー＆ペーストしてください。
@@ -134,11 +134,11 @@ After=network.target
 
 [Service]
 # 実行するユーザー名と、Botのファイルがあるディレクトリ
-User=paladmin
-WorkingDirectory=/home/paladmin/bot/medicine_notice_bot
+User=bots
+WorkingDirectory=/home/bots/bot/medicine_notice_bot
 
 # 実行するコマンド（venv内のpython3の絶対パスとファイルの絶対パス）
-ExecStart=/home/paladmin/bot/medicine_notice_bot/venv/bin/python3 /home/paladmin/bot/medicine_notice_bot/medicine_bot.py
+ExecStart=/home/bots/bot/medicine_notice_bot/venv/bin/python3 /home/bots/bot/medicine_notice_bot/medicine_bot.py
 
 # エラーで落ちた場合、常に自動再起動する設定
 Restart=always
@@ -196,8 +196,8 @@ sudo systemctl status medicine_bot.service
 `main` ブランチに push する（PRをマージする）と、`.github/workflows/deploy.yml` が次の順で実行されます。Actions 画面の「Run workflow」から手動でも実行できます。自動で動くのは `medicine_bot.py` か `requirements.txt` が変わったときだけです（ワークフローやドキュメントだけの変更では本番の Bot を再起動しません）。
 
 1. **validate**（GitHub のランナー）: 依存パッケージのインストール、構文チェック、単体テスト（`tests/`）
-2. **deploy**（palserver のセルフホストランナー、ラベル `medicine-bot`）: `sudo /usr/local/sbin/medicine-bot-deploy` を実行
-   * `medicine_bot.py` と `requirements.txt` を `/home/paladmin/bot/medicine_notice_bot` に配置（`.env` と `venv` はサーバー側のものを使います）
+2. **deploy**（bots コンテナ（CT108）のセルフホストランナー、ラベル `medicine-bot`）: `sudo /usr/local/sbin/medicine-bot-deploy` を実行
+   * `medicine_bot.py` と `requirements.txt` を `/home/bots/bot/medicine_notice_bot` に配置（`.env` と `venv` はサーバー側のものを使います）
    * `requirements.txt` が変わったときだけ `venv` に依存パッケージをインストール
    * `medicine_bot.service` を再起動し、15秒後も落ちずに動いているかを確認
    * 起動に失敗したら、配置前の状態（`/var/backups/medicine-bot` に5世代まで退避）に戻してジョブを失敗にします
@@ -205,22 +205,22 @@ sudo systemctl status medicine_bot.service
 手動実行で `main` 以外のブランチを選んでも、本番には入りません（validate だけが動きます）。
 
 #### テスト用 Bot（ステージング）
-マージする前のブランチを、本番と同じ palserver・同じ Python・同じデプロイスクリプトで試せます。
+マージする前のブランチを、本番と同じ bots コンテナ（CT108）・同じ Python・同じデプロイスクリプトで試せます。
 
 * Actions 画面で **Deploy (staging)** を開き、「Run workflow」で試したいブランチを選んで実行します（`gh workflow run deploy-staging.yml --ref <ブランチ名>` でも同じです）。
-* 配置先は `/home/paladmin/bot/medicine_notice_bot_staging`、サービスは `medicine_bot_staging.service` です。`.env`（テスト用 Bot のトークンとテスト用チャンネル）と `data/` は本番と別なので、本番の記録には影響しません。
+* 配置先は `/home/bots/bot/medicine_notice_bot_staging`、サービスは `medicine_bot_staging.service` です。`.env`（テスト用 Bot のトークンとテスト用チャンネル）と `data/` は本番と別なので、本番の記録には影響しません。
 * 定刻の通知を試すときは、テスト用チャンネルで `/remind_time` を数分後に、`/interval` を `1` にすると流れをすぐ確認できます。
 
 #### セキュリティ上の構成
-* ランナーは専用ユーザー `gh-runner` で動きます（`paladmin` の権限は持ちません）。
+* ランナーは専用ユーザー `gh-runner` で動きます（Bot を動かす `bots` の権限は持ちません）。
 * `gh-runner` が sudo できるのは `/usr/local/sbin/medicine-bot-deploy` と `/usr/local/sbin/medicine-bot-deploy-staging` だけです。どちらもリポジトリ内の `deploy/medicine-bot-deploy` を root 所有でコピーしたもので（実行時の名前で配置先を切り替えます）、リポジトリ側のスクリプトを直接 root で実行することはありません。**`deploy/medicine-bot-deploy` を変更したら、サーバーへの再設置が必要です**（下の手順を `RUNNER_TOKEN` なしで再実行）。
 * ワークフローは `pull_request` では動かしません。また、フォークからのPRのワークフローは「Require approval for all external contributors」に設定しています。
 
 #### 初回セットアップ（サーバー側）
 1. GitHub の **Settings > Actions > Runners > New self-hosted runner** に表示される登録トークンを控えます（`gh api -X POST repos/kadmalcun/Medicine_Remind_DiscordBot/actions/runners/registration-token --jq .token` でも取得できます。有効期限は1時間）。
-2. palserver にこのリポジトリを取得し、root で初期設定スクリプトを実行します。デプロイスクリプトの設置、sudoers の設定、テスト用 Bot の配置先・venv・サービスの用意、ランナーの登録とサービス化までを行います。
+2. bots コンテナ（CT108）にこのリポジトリを取得し、root で初期設定スクリプトを実行します。デプロイスクリプトの設置、sudoers の設定、テスト用 Bot の配置先・venv・サービスの用意、ランナーの登録とサービス化までを行います。
    ```bash
    sudo RUNNER_TOKEN=<登録トークン> bash deploy/setup-server.sh
    ```
-3. Runners の画面で `palserver-medicine` が「Idle」になれば準備完了です。
-4. テスト用 Bot を使う場合は、Discord Developer Portal でテスト用の Bot を別に作り、`/home/paladmin/bot/medicine_notice_bot_staging/.env` にそのトークンとテスト用チャンネルの ID を書きます（書式は `.env.example` と同じ）。
+3. Runners の画面で `bots-medicine` が「Idle」になれば準備完了です。
+4. テスト用 Bot を使う場合は、Discord Developer Portal でテスト用の Bot を別に作り、`/home/bots/bot/medicine_notice_bot_staging/.env` にそのトークンとテスト用チャンネルの ID を書きます（書式は `.env.example` と同じ）。
